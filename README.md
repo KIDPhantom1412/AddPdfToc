@@ -7,11 +7,11 @@ Agent skill that adds a hierarchical **bookmark outline** (sidebar table of cont
 Requires [Node.js](https://nodejs.org/) so `npx` works. No skills.sh account and no marketplace submission.
 
 ```bash
-# This repo, user-level Cursor skill (any project)
-npx skills add . -g --agent cursor
+# This repo, user-level skill (any project)
+npx skills add . -g
 
-# After the repo is on GitHub (replace owner)
-npx skills add KIDPhantom1412/AddPdfToc -g --agent cursor
+# After the repo is on GitHub
+npx skills add KIDPhantom1412/AddPdfToc -g
 ```
 
 List what the installer sees:
@@ -20,11 +20,11 @@ List what the installer sees:
 npx skills add . --list
 ```
 
-Without Node, copy `skills/add-pdf-toc/` to `~/.cursor/skills/add-pdf-toc/` (or the current project's `.agents/skills/`).
+Without Node, copy `skills/add-pdf-toc/` to the user-level `~/.agents/skills/add-pdf-toc/` (or the current project's `.agents/skills/`).
 
 ## Use
 
-In Cursor Agent chat, ask for example:
+In your coding agent's chat, ask for example:
 
 > Add a table of contents to `D:\books\example.pdf`
 
