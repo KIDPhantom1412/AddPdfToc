@@ -12,7 +12,7 @@ detect → ocr → coarse (1, serial)
               write-toc
 ```
 
-Launch each parallel group in **one turn**. A platform `resource_exhausted` on one agent is not a reason to serialize the rest; retry the missing chapter.
+Launch each parallel group in bounded batches (3–5 subagents per batch). A platform `resource_exhausted` or rate limit on one agent is not a reason to serialize everything; retry the missing chapter.
 
 Pass only the sliced JSONL and the printed-TOC fragment for that chapter.
 

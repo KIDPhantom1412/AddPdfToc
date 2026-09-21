@@ -120,7 +120,14 @@ def _guess_language(samples: Iterable[str]) -> str:
     if not text:
         return "unknown"
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    kana = sum(1 for ch in text if ("\u3040" <= ch <= "\u309f") or ("\u30a0" <= ch <= "\u30ff"))
+    hangul = sum(1 for ch in text if "\uac00" <= ch <= "\ud7af")
     latin = sum(1 for ch in text if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
+
+    if kana > 10:
+        return "japan"
+    if hangul > 10:
+        return "korean"
     if cjk > latin * 0.3 and cjk > 20:
         return "chi_sim+eng" if latin else "chi_sim"
     if latin:
@@ -293,8 +300,9 @@ def _ocr_rapidocr(args: argparse.Namespace, pdf: Path, work: Path, language: str
     overlay_errors = 0
     pages_done = 0
 
+    mode = "a" if args.append else "w"
     try:
-        with jsonl_path.open("w", encoding="utf-8") as handle:
+        with jsonl_path.open(mode, encoding="utf-8") as handle:
             for index in range(start, end + 1):
                 page = doc[index - 1]
                 pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
@@ -661,6 +669,7 @@ def build_parser() -> argparse.ArgumentParser:
     ocr.add_argument("--end", type=int)
     ocr.add_argument("--dpi", type=int, default=DEFAULT_OCR_DPI)
     ocr.add_argument("--deskew", action="store_true")
+    ocr.add_argument("--append", action="store_true", help="Append OCR lines to pages_out instead of overwriting")
 
     extract = sub.add_parser("extract", help="Write per-page JSONL text")
     extract.add_argument("pdf")

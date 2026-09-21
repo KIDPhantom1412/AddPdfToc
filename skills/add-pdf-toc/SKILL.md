@@ -25,14 +25,20 @@ uv run "$SCRIPT" check-deps
 
 If `uv` is missing, stop and tell the user to install it: https://docs.astral.sh/uv/getting-started/installation/ — do not fall back to pip or a harness venv. Do not add `--with` packages.
 
-## OCR language
+## OCR language & bilingual texts
 
 Do not hardcode a language in this skill. Before `ocr`:
 
-1. Guess the script from the cover, filename, user, or `meta.language_guess` (scans are often `unknown`).
-2. Read `rapidocr_lang_rec` from `check-deps` (RapidOCR's own `rapidocr --help` does **not** list language codes). In the same env you can also run `rapidocr --help` for CLI flags.
+1. Guess the primary script from the cover, filename, user, or `meta.language_guess` (scans are often `unknown`).
+2. Read `rapidocr_lang_rec` from `check-deps` (RapidOCR's own `rapidocr --help` does **not** list language codes).
 3. Map the guess onto a `LangRec` value from that list. Use [RapidOCR model list](https://rapidai.github.io/RapidOCRDocs/main/model_list/) if the enum is ambiguous (e.g. German → `latin`).
-4. Pass that code to `ocr --language`.
+4. **Bilingual / Mixed text strategy (RapidOCR limitations)**:
+   - RapidOCR's recognition engine (`PP-OCRv6_rec`) is fundamentally single-model: it accepts only **one** `Rec.lang_type` per instance. There is no built-in "multi-language ensemble" or automatic cross-language switching.
+   - For language-learning materials and bilingual books (such as Chinese-Japanese, English-Chinese):
+     - **CJK Language Choice**: The `japan` recognition model contains Hiragana, Katakana, and standard Kanji (Kanji characters overlap significantly with Chinese Hanzi). For Japanese textbooks (`标日`), `--language japan` provides the highest accuracy for Japanese titles while maintaining acceptable Chinese recognition.
+     - **Chinese / English mix**: The default `ch` model recognizes Simplified Chinese, Punctuation, and Latin/English characters cleanly.
+     - **TOC Title Formatting**: If a heading in TOC is bilingual (e.g. `第16课 雇用 ①求人案内`), prioritize matching the section's primary native book language or the language used in the printed 目次.
+5. Pass the chosen code to `ocr --language`.
 
 ## Commands
 
@@ -55,28 +61,39 @@ Copy and tick:
 ```
 - [ ] check-deps
 - [ ] detect
-- [ ] if needs_ocr: look up LangRec, then ocr
+- [ ] if needs_ocr: look up LangRec, then Phase 1 front-matter OCR (--start 1 --end 30)
 - [ ] extract only if digital / font hints needed
-- [ ] coarse map (one subagent) -> printed_toc.json + chapters.json
-- [ ] fine headings: launch all chapter subagents in parallel
+- [ ] coarse map (one subagent) -> printed_toc.json + page_offset + chapters.json
+- [ ] fine headings: chapter subagents in bounded batches (3-5 parallel)
 - [ ] merge outline.proposed.json
 - [ ] check-outline (cheap)
-- [ ] verify (subagents, parallel by chapter)
+- [ ] verify: targeted page-window OCR & subagent verification
 - [ ] fix / rerun failing chapters
 - [ ] write-toc + report.md
 ```
 
-Serial until `chapters.json` exists. Then fine-heading subagents in parallel; then verify subagents in parallel. Do not start the next stage until the previous barrier is done.
+Serial until `chapters.json` and `page_offset` exist. Then fine-heading subagents in bounded parallel batches; then verify subagents. Do not start the next stage until the previous barrier is done.
 
 ### 1. Detect
 
-Run `detect`. If `has_existing_toc` and the user did not ask to replace it, ask before overwriting.
+Run `detect`. Existing bookmarks in the source PDF will not block the process (final output writes to a separate `<stem>.with-toc.pdf` file with a clean outline by default, leaving the original file intact; do not interrupt to ask the user unless they explicitly asked to preserve or merge old bookmarks).
 
-### 2. Text layer
+### 2. Text layer (Two-Phase Strategy)
 
-If `needs_ocr` is true, pick `--language` as above, then `ocr --engine rapidocr` (add `--start/--end` when the user caps the range). RapidOCR writes `pages.jsonl` from recognized text. Pass `--out searchable.pdf` only if the user wants an invisible-text overlay (rewrites the whole PDF; skip for large scans unless asked). Skip a second `extract` unless you need font hints from a digital PDF.
+For scanned PDFs (`needs_ocr: true`), **do not run full-book OCR upfront**—full-book OCR across hundreds of pages is slow and CPU-heavy. Instead, use a **two-phase OCR workflow**:
 
-`extract` still works on searchable/digital PDFs. Subsequent AI reads **page-aligned JSONL only**, not screenshots.
+1. **Phase 1 (Front-Matter & TOC Skeleton)**:
+   - OCR only the front matter (typically pages 1 to 25–40, e.g. `--start 1 --end 30`) using `--pages-out <work>/pages.jsonl`.
+   - Run coarse mapping on this slice to find `printed_toc.json` and calculate `page_offset = pdf_page - printed_page`.
+   - Sample 2–3 early body chapter start pages with `--start N --end N` to verify and lock in `page_offset`.
+2. **Phase 2 (Targeted Verification Sampling)**:
+   - If a reliable printed TOC and offset are established, the outline backbone can be mapped directly.
+   - Run OCR only on targeted chapter starting pages and section windows (`page-window` radius 1) for subagent verification and deeper heading extraction, rather than OCRing the entire book.
+   - If the book lacks a printed TOC, split into ~30-page chunks and OCR chunks sequentially or in bounded batches.
+
+Pass `--out searchable.pdf` only if the user explicitly requested an invisible-text searchable PDF overlay. Skip a second `extract` unless you need font hints from a digital PDF.
+
+`extract` is used directly on digital/searchable PDFs without OCR. Subsequent AI reads **page-aligned JSONL only**, not screenshots.
 
 ### 3. Coarse map
 
@@ -86,9 +103,11 @@ If there is no printed TOC, split into ~30-page chunks (adjust at obvious chapte
 
 ### 4. Fine outline
 
-Launch **one subagent per chapter** (or chunk) **in the same turn**. Each gets only its slice + the printed TOC fragment for that chapter. If one fails (`resource_exhausted` or similar), retry **that** subagent; do not read its JSONL yourself.
+Launch fine-heading subagents by chapter (or chunk).
+- **Concurrency control:** When books have many chapters (e.g. 15–30 chapters), do not flood the API with dozens of concurrent subagents at once. Launch in bounded parallel batches of 3–5 chapters to avoid platform rate limits (`RateLimitError`, `resource_exhausted`) and maintain consistent heading depth.
+- Each agent receives only its slice + the printed TOC fragment for that chapter. If one fails, retry **that** subagent; do not read its JSONL yourself.
 
-Merge into `outline.proposed.json`: printed TOC as chapter/section backbone, body headings as deeper levels. Run `check-outline`. Fix level jumps and backward pages before verify.
+Merge into `outline.proposed.json`: printed TOC as chapter/section backbone, body headings as deeper levels. Run `check-outline`. Fix level jumps and backward pages before verify (note: for right-to-left / reverse-bound Japanese classical texts or appendices reading backwards, handle leaf sections carefully).
 
 ### 5. Verify and write
 
