@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import statistics
 import subprocess
@@ -251,27 +252,70 @@ def _insert_invisible_ocr(page, lines: list[tuple[list[list[float]], str, float]
 
     written = 0
     for box, txt, _score in lines:
+        txt_str = txt.strip()
+        if not txt_str:
+            continue
         xs = [p[0] / zoom for p in box]
         ys = [p[1] / zoom for p in box]
-        rect = pymupdf.Rect(min(xs), min(ys), max(xs), max(ys))
-        if rect.width < 1 or rect.height < 1:
+        x0, y0 = min(xs), min(ys)
+        x1, y1 = max(xs), max(ys)
+        w = x1 - x0
+        h = y1 - y0
+        if w < 1 or h < 1:
             continue
-        fontsize = max(4.0, min(rect.height * 0.9, 48.0))
+        fontsize = max(4.0, min(h * 0.85, 48.0))
+        point = pymupdf.Point(x0, y1 - h * 0.15)
         try:
-            rc = page.insert_textbox(
-                rect,
-                txt,
+            rc = page.insert_text(
+                point,
+                txt_str,
                 fontname=fontname,
                 fontsize=fontsize,
                 color=(0, 0, 0),
                 render_mode=3,
                 overlay=True,
             )
+            if rc >= 0:
+                written += 1
         except Exception:
             continue
-        if rc >= 0:
-            written += 1
     return written
+
+
+_worker_engine: Any = None
+
+
+def _ocr_worker_init(rec_lang: str) -> None:
+    global _worker_engine
+    try:
+        from rapidocr import RapidOCR
+
+        _worker_engine = RapidOCR(params={"Rec.lang_type": rec_lang, "EngineConfig.onnxruntime.intra_op_num_threads": 2})
+    except Exception:
+        _worker_engine = None
+
+
+def _ocr_worker_task(args: tuple[str, int, float]) -> tuple[int, list[tuple[list[list[float]], str, float]], str | None]:
+    pdf_str, index, zoom = args
+    import pymupdf
+
+    doc = pymupdf.open(pdf_str)
+    try:
+        page = doc[index - 1]
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+        img_bytes = pix.tobytes("png")
+    finally:
+        doc.close()
+
+    if _worker_engine is None:
+        return index, [], "RapidOCR engine not initialized in worker"
+
+    try:
+        result = _worker_engine(img_bytes)
+        lines = _rapidocr_lines(result)
+        return index, lines, None
+    except Exception as exc:
+        return index, [], str(exc)
 
 
 def _ocr_rapidocr(args: argparse.Namespace, pdf: Path, work: Path, language: str) -> dict[str, Any]:
@@ -282,7 +326,7 @@ def _ocr_rapidocr(args: argparse.Namespace, pdf: Path, work: Path, language: str
 
     pymupdf = _require_pymupdf()
     rec_lang = _rapidocr_rec_lang(language)
-    fontname = "japan" if rec_lang == "japan" else "china-s"
+    fontname = "china-s" if rec_lang in {"japan", "ch", "chinese_cht"} else "helv"
     dpi = int(args.dpi or DEFAULT_OCR_DPI)
     zoom = dpi / 72.0
     start = args.start or 1
@@ -293,68 +337,122 @@ def _ocr_rapidocr(args: argparse.Namespace, pdf: Path, work: Path, language: str
         doc.close()
         _die(f"Invalid page range {start}-{end} for page_count={page_count}")
 
-    engine = RapidOCR(params={"Rec.lang_type": rec_lang})
+    workers = max(1, getattr(args, "workers", 1) or 1)
     jsonl_path = Path(args.pages_out).expanduser().resolve() if args.pages_out else work / "pages.jsonl"
     out_pdf = Path(args.out).expanduser().resolve() if args.out else None
     overlay_written = 0
     overlay_errors = 0
     pages_done = 0
+    saved_tmp = False
+    tmp_pdf = None
 
     mode = "a" if args.append else "w"
     try:
         with jsonl_path.open(mode, encoding="utf-8") as handle:
-            for index in range(start, end + 1):
-                page = doc[index - 1]
-                pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
-                try:
-                    result = engine(pix.tobytes("png"))
-                    lines = _rapidocr_lines(result)
-                except Exception as exc:
-                    lines = []
+            if workers > 1 and (end - start + 1) > 1:
+                from concurrent.futures import ProcessPoolExecutor
+
+                tasks = [(str(pdf), index, zoom) for index in range(start, end + 1)]
+                with ProcessPoolExecutor(max_workers=workers, initializer=_ocr_worker_init, initargs=(rec_lang,)) as executor:
+                    for index, lines, err in executor.map(_ocr_worker_task, tasks, chunksize=1):
+                        if err:
+                            print(
+                                json.dumps({"ok": False, "page": index, "error": err}, ensure_ascii=False),
+                                file=sys.stderr,
+                            )
+                        text = _lines_to_text(lines)
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "page": index,
+                                    "char_count": len(text.strip()),
+                                    "text": text,
+                                    "font_heading_hints": [],
+                                    "ocr_engine": "rapidocr",
+                                    "ocr_line_count": len(lines),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        handle.flush()
+                        if out_pdf is not None:
+                            try:
+                                overlay_written += _insert_invisible_ocr(doc[index - 1], lines, zoom, fontname)
+                            except Exception:
+                                overlay_errors += 1
+                        pages_done += 1
+                        print(
+                            json.dumps(
+                                {
+                                    "progress": True,
+                                    "page": index,
+                                    "end": end,
+                                    "chars": len(text.strip()),
+                                    "lines": len(lines),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            file=sys.stderr,
+                        )
+            else:
+                engine = RapidOCR(params={"Rec.lang_type": rec_lang})
+                for index in range(start, end + 1):
+                    page = doc[index - 1]
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+                    try:
+                        result = engine(pix.tobytes("png"))
+                        lines = _rapidocr_lines(result)
+                    except Exception as exc:
+                        lines = []
+                        print(
+                            json.dumps({"ok": False, "page": index, "error": str(exc)}, ensure_ascii=False),
+                            file=sys.stderr,
+                        )
+                    text = _lines_to_text(lines)
+                    handle.write(
+                        json.dumps(
+                            {
+                                "page": index,
+                                "char_count": len(text.strip()),
+                                "text": text,
+                                "font_heading_hints": [],
+                                "ocr_engine": "rapidocr",
+                                "ocr_line_count": len(lines),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    handle.flush()
+                    if out_pdf is not None:
+                        try:
+                            overlay_written += _insert_invisible_ocr(page, lines, zoom, fontname)
+                        except Exception:
+                            overlay_errors += 1
+                    pages_done += 1
                     print(
-                        json.dumps({"ok": False, "page": index, "error": str(exc)}, ensure_ascii=False),
+                        json.dumps(
+                            {
+                                "progress": True,
+                                "page": index,
+                                "end": end,
+                                "chars": len(text.strip()),
+                                "lines": len(lines),
+                            },
+                            ensure_ascii=False,
+                        ),
                         file=sys.stderr,
                     )
-                text = _lines_to_text(lines)
-                handle.write(
-                    json.dumps(
-                        {
-                            "page": index,
-                            "char_count": len(text.strip()),
-                            "text": text,
-                            "font_heading_hints": [],
-                            "ocr_engine": "rapidocr",
-                            "ocr_line_count": len(lines),
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-                handle.flush()
-                if out_pdf is not None:
-                    try:
-                        overlay_written += _insert_invisible_ocr(page, lines, zoom, fontname)
-                    except Exception:
-                        overlay_errors += 1
-                pages_done += 1
-                print(
-                    json.dumps(
-                        {
-                            "progress": True,
-                            "page": index,
-                            "end": end,
-                            "chars": len(text.strip()),
-                            "lines": len(lines),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    file=sys.stderr,
-                )
         if out_pdf is not None:
             out_pdf.parent.mkdir(parents=True, exist_ok=True)
-            doc.save(out_pdf, garbage=4, deflate=True)
+            tmp_pdf = out_pdf.with_name(f"{out_pdf.stem}.tmp_{os.getpid()}{out_pdf.suffix}")
+            doc.save(tmp_pdf, garbage=4, deflate=True)
+            saved_tmp = True
     finally:
         doc.close()
+        if saved_tmp and tmp_pdf is not None and tmp_pdf.exists():
+            tmp_pdf.replace(out_pdf)
 
     return {
         "ok": True,
@@ -670,6 +768,7 @@ def build_parser() -> argparse.ArgumentParser:
     ocr.add_argument("--dpi", type=int, default=DEFAULT_OCR_DPI)
     ocr.add_argument("--deskew", action="store_true")
     ocr.add_argument("--append", action="store_true", help="Append OCR lines to pages_out instead of overwriting")
+    ocr.add_argument("--workers", type=int, default=1, help="Number of parallel worker processes for OCR (default 1)")
 
     extract = sub.add_parser("extract", help="Write per-page JSONL text")
     extract.add_argument("pdf")
